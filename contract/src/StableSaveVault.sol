@@ -2,10 +2,14 @@
 pragma solidity ^0.8.24;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {
+    SafeERC20
+} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {
+    ReentrancyGuard
+} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 import {IYieldStrategy} from "./interfaces/IYieldStrategy.sol";
 
@@ -14,6 +18,7 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
 
     uint256 public constant BPS = 10_000;
     uint256 public constant MAX_PENALTY_BPS = 1_000; // 10%
+    uint256 public constant MINIMUM_LIQUIDITY = 1e3;
 
     IERC20 public immutable usdt;
 
@@ -136,13 +141,7 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
 
         _userVaultIds[msg.sender].push(vaultId);
 
-        emit VaultCreated(
-            vaultId,
-            msg.sender,
-            start,
-            maturity,
-            targetAmount
-        );
+        emit VaultCreated(vaultId, msg.sender, start, maturity, targetAmount);
     }
 
     // ---------------------------------------------------------
@@ -188,22 +187,14 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
 
         totalShares += shares;
 
-        emit DepositMade(
-            vaultId,
-            msg.sender,
-            amount,
-            shares,
-            block.timestamp
-        );
+        emit DepositMade(vaultId, msg.sender, amount, shares, block.timestamp);
     }
 
     // ---------------------------------------------------------
     // WITHDRAWAL
     // ---------------------------------------------------------
 
-    function withdraw(
-        uint256 vaultId
-    ) external nonReentrant whenNotPaused {
+    function withdraw(uint256 vaultId) external nonReentrant whenNotPaused {
         Vault storage vault = _getOwnedVault(vaultId);
 
         if (vault.status != VaultStatus.Active) {
@@ -247,9 +238,7 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
         uint256 penalty;
 
         if (early) {
-            penalty =
-                (grossAmount * earlyWithdrawalPenaltyBps) /
-                BPS;
+            penalty = (grossAmount * earlyWithdrawalPenaltyBps) / BPS;
         }
 
         uint256 netAmount = grossAmount - penalty;
@@ -287,20 +276,14 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
     )
         external
         view
-        returns (
-            uint256 grossAmount,
-            uint256 penalty,
-            uint256 netAmount
-        )
+        returns (uint256 grossAmount, uint256 penalty, uint256 netAmount)
     {
         Vault storage vault = _getVault(vaultId);
 
         grossAmount = _convertToAssets(vault.shares);
 
         if (block.timestamp < vault.maturityTime) {
-            penalty =
-                (grossAmount * earlyWithdrawalPenaltyBps) /
-                BPS;
+            penalty = (grossAmount * earlyWithdrawalPenaltyBps) / BPS;
         }
 
         netAmount = grossAmount - penalty;
@@ -318,15 +301,11 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
     // SHARE ACCOUNTING
     // ---------------------------------------------------------
 
-    function convertToShares(
-        uint256 assets
-    ) external view returns (uint256) {
+    function convertToShares(uint256 assets) external view returns (uint256) {
         return _convertToShares(assets, totalAssets());
     }
 
-    function convertToAssets(
-        uint256 shares
-    ) external view returns (uint256) {
+    function convertToAssets(uint256 shares) external view returns (uint256) {
         return _convertToAssets(shares);
     }
 
@@ -334,16 +313,14 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
         uint256 assets,
         uint256 assetsBefore
     ) internal view returns (uint256) {
-        if (totalShares == 0 || assetsBefore == 0) {
-            return assets;
+        if (totalShares == 0) {
+            // burn MINIMUM_LIQUIDITY once at the very first deposit
+            return assets - MINIMUM_LIQUIDITY; // minted separately to address(0)
         }
-
         return (assets * totalShares) / assetsBefore;
     }
 
-    function _convertToAssets(
-        uint256 shares
-    ) internal view returns (uint256) {
+    function _convertToAssets(uint256 shares) internal view returns (uint256) {
         if (shares == 0 || totalShares == 0) {
             return 0;
         }
@@ -378,10 +355,7 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
             revert InsufficientLiquidity();
         }
 
-        uint256 withdrawn = strategy.withdraw(
-            required,
-            address(this)
-        );
+        uint256 withdrawn = strategy.withdraw(required, address(this));
 
         if (withdrawn < required) {
             revert InsufficientLiquidity();
@@ -392,9 +366,7 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
     // STRATEGY
     // ---------------------------------------------------------
 
-    function setStrategy(
-        address newStrategy
-    ) external onlyOwner {
+    function setStrategy(address newStrategy) external onlyOwner {
         if (totalShares != 0) {
             revert StrategyAlreadyConfigured();
         }
@@ -410,6 +382,13 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
         strategy = IYieldStrategy(newStrategy);
 
         emit StrategyUpdated(previous, newStrategy);
+    }
+
+    function exitStrategy() external onlyOwner {
+        uint256 assets = strategy.totalAssets();
+        if (assets > 0) strategy.withdraw(assets, address(this));
+        // keep strategy address so deposits flow through again, or set to zero:
+        strategy = IYieldStrategy(address(0));
     }
 
     // ---------------------------------------------------------
@@ -442,9 +421,7 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
     // VIEWS
     // ---------------------------------------------------------
 
-    function getVault(
-        uint256 vaultId
-    ) external view returns (Vault memory) {
+    function getVault(uint256 vaultId) external view returns (Vault memory) {
         return _getVault(vaultId);
     }
 
@@ -458,15 +435,11 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
         return _nextVaultId;
     }
 
-    function isMatured(
-        uint256 vaultId
-    ) external view returns (bool) {
+    function isMatured(uint256 vaultId) external view returns (bool) {
         return block.timestamp >= _getVault(vaultId).maturityTime;
     }
 
-    function vaultCount(
-        address user
-    ) external view returns (uint256) {
+    function vaultCount(address user) external view returns (uint256) {
         return _userVaultIds[user].length;
     }
 

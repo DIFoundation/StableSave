@@ -485,6 +485,37 @@ contract StableSaveVaultTest is Test {
         assertEq(vault.previewVaultValue(vaultId), 100 * USDT);
     }
 
+    function testSetTreasuryUpdatesTreasuryAndRoutesFuturePenalties() public {
+        address newTreasury = address(0xBEEF);
+
+        vault.setTreasury(newTreasury);
+        assertEq(vault.treasury(), newTreasury);
+
+        vm.prank(alice);
+        uint256 vaultId = vault.createVault(30 days, 100 * USDT);
+
+        vm.prank(alice);
+        vault.deposit(vaultId, 100 * USDT);
+
+        vm.prank(alice);
+        vault.earlyWithdraw(vaultId);
+
+        // 2% default penalty on 100 USDT
+        assertEq(usdt.balanceOf(newTreasury), 2 * USDT);
+        assertEq(usdt.balanceOf(address(this)), 0);
+    }
+
+    function testSetTreasuryRevertsOnZeroAddress() public {
+        vm.expectRevert(StableSaveVault.InvalidTreasury.selector);
+        vault.setTreasury(address(0));
+    }
+
+    function testSetTreasuryRevertsForNonOwner() public {
+        vm.prank(alice);
+        vm.expectRevert();
+        vault.setTreasury(address(0xBEEF));
+    }
+
     function testFuzzDeposit(
         uint256 amount
     ) public {

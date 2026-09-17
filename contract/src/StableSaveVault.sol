@@ -22,7 +22,7 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
 
     IYieldStrategy public strategy;
 
-    address public immutable treasury;
+    address public treasury;
 
     uint256 public earlyWithdrawalPenaltyBps = 200; // 2%
 
@@ -100,6 +100,10 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
     );
 
     event PenaltyUpdated(uint256 previousBps, uint256 newBps);
+    event TreasuryUpdated(
+        address indexed previousTreasury,
+        address indexed newTreasury
+    );
 
     error InvalidDuration();
     error InvalidTarget();
@@ -115,6 +119,7 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
     error InsufficientLiquidity();
     error InvalidShares();
     error FirstDepositTooSmall();
+    error InvalidTreasury();
 
     constructor(
         address _usdt,
@@ -441,6 +446,21 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
         earlyWithdrawalPenaltyBps = newPenaltyBps;
 
         emit PenaltyUpdated(previous, newPenaltyBps);
+    }
+
+    /// @notice Update where early-withdrawal penalties are sent.
+    /// @dev Unlike `usdt`, `treasury` is intentionally mutable — a fixed
+    /// EOA is a single point of failure with no recovery path if its key
+    /// is ever lost or compromised. Point this at a dedicated treasury
+    /// contract (or a multisig) and rotate it if that ever needs to change.
+    function setTreasury(address newTreasury) external onlyOwner {
+        if (newTreasury == address(0)) revert InvalidTreasury();
+
+        address previous = treasury;
+
+        treasury = newTreasury;
+
+        emit TreasuryUpdated(previous, newTreasury);
     }
 
     function pause() external onlyOwner {

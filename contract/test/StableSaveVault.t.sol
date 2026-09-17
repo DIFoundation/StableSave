@@ -203,7 +203,7 @@ contract StableSaveVaultTest is Test {
 
         strategy.addYield(20 * USDT);
 
-        vm.prank(alice);
+        vm.prank(bob);
 
         uint256 bobVault = vault.createVault(
             30 days,
@@ -218,9 +218,13 @@ contract StableSaveVaultTest is Test {
             120 * USDT
         );
 
-        assertEq(
+        // Bob is buying in at a 120/100 share price, which doesn't divide
+        // evenly; integer division rounds in the vault's favor by at most
+        // 1 unit (1e-6 USDT), which is expected for share-based accounting.
+        assertApproxEqAbs(
             vault.previewVaultValue(bobVault),
-            100 * USDT
+            100 * USDT,
+            1
         );
     }
 
@@ -294,9 +298,12 @@ contract StableSaveVaultTest is Test {
             150 * USDT
         );
 
-        assertEq(
+        // Same 1-unit rounding note as testYieldIsDistributedByShares above:
+        // bob buys in at a 150/100 price that doesn't divide evenly.
+        assertApproxEqAbs(
             vault.previewVaultValue(bobVault),
-            100 * USDT
+            100 * USDT,
+            1
         );
     }
 
@@ -430,6 +437,52 @@ contract StableSaveVaultTest is Test {
         assertEq(gross, 100 * USDT);
         assertEq(penalty, 2 * USDT);
         assertEq(net, 98 * USDT);
+    }
+
+    function testFirstDepositBelowMinimumLiquidityReverts() public {
+        vm.prank(alice);
+
+        uint256 vaultId = vault.createVault(
+            30 days,
+            100 * USDT
+        );
+
+        vm.prank(alice);
+
+        vm.expectRevert(
+            StableSaveVault.FirstDepositTooSmall.selector
+        );
+
+        // 1 raw unit is below MINIMUM_LIQUIDITY (1e3) for the very first
+        // deposit into the whole vault.
+        vault.deposit(vaultId, 1);
+    }
+
+    function testExitStrategyRevertsWhenNoStrategySet() public {
+        vm.expectRevert(
+            StableSaveVault.InvalidStrategy.selector
+        );
+
+        vault.exitStrategy();
+    }
+
+    function testExitStrategyReturnsFundsToIdleBalance() public {
+        strategy = new MockYieldStrategy(address(usdt));
+        vault.setStrategy(address(strategy));
+
+        vm.prank(alice);
+        uint256 vaultId = vault.createVault(30 days, 100 * USDT);
+
+        vm.prank(alice);
+        vault.deposit(vaultId, 100 * USDT);
+
+        assertEq(usdt.balanceOf(address(strategy)), 100 * USDT);
+
+        vault.exitStrategy();
+
+        assertEq(address(vault.strategy()), address(0));
+        assertEq(usdt.balanceOf(address(vault)), 100 * USDT);
+        assertEq(vault.previewVaultValue(vaultId), 100 * USDT);
     }
 
     function testFuzzDeposit(

@@ -2,19 +2,17 @@
 pragma solidity ^0.8.24;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {
-    SafeERC20
-} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
-import {
-    ReentrancyGuard
-} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 import {IYieldStrategy} from "./interfaces/IYieldStrategy.sol";
 
 contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
+    using SafeCast for uint256;
 
     uint256 public constant BPS = 10_000;
     uint256 public constant MAX_PENALTY_BPS = 1_000; // 10%
@@ -37,16 +35,34 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
         Withdrawn
     }
 
+    // Field order here is deliberate: it packs the whole struct into 3
+    // storage slots instead of 9 (one per field, the Solidity default for
+    // a struct built entirely out of address/uint256/enum). Every deposit
+    // and withdrawal touches most of these fields, so fewer slots means
+    // fewer SSTOREs and materially cheaper gas per transaction — the
+    // difference matters most for exactly the kind of small, frequent
+    // deposits this vault is designed around.
+    //
+    // slot 0: owner (20B) + status (1B) + depositCount (4B)      = 25B
+    // slot 1: startTime + maturityTime + lastDepositAt (5B each)
+    //         + shares (16B)                                     = 31B
+    // slot 2: targetAmount (16B) + depositedAmount (16B)         = 32B
+    //
+    // uint40 timestamps are valid until roughly the year 36,800 — no
+    // practical limit. uint128 amounts cap out around 3.4e38 raw units,
+    // far beyond any realistic USDT supply even at 6 decimals. All
+    // narrowing conversions from uint256 go through SafeCast, so an
+    // out-of-range value reverts instead of silently truncating.
     struct Vault {
         address owner;
-        uint256 startTime;
-        uint256 maturityTime;
-        uint256 targetAmount;
-        uint256 depositedAmount;
-        uint256 shares;
-        uint256 depositCount;
-        uint256 lastDepositAt;
         VaultStatus status;
+        uint32 depositCount;
+        uint40 startTime;
+        uint40 maturityTime;
+        uint40 lastDepositAt;
+        uint128 shares;
+        uint128 targetAmount;
+        uint128 depositedAmount;
     }
 
     mapping(uint256 => Vault) private _vaults;
@@ -98,6 +114,7 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
     error InvalidPenalty();
     error InsufficientLiquidity();
     error InvalidShares();
+    error FirstDepositTooSmall();
 
     constructor(
         address _usdt,
@@ -129,14 +146,14 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
 
         _vaults[vaultId] = Vault({
             owner: msg.sender,
-            startTime: start,
-            maturityTime: maturity,
-            targetAmount: targetAmount,
-            depositedAmount: 0,
-            shares: 0,
+            status: VaultStatus.Active,
             depositCount: 0,
+            startTime: start.toUint40(),
+            maturityTime: maturity.toUint40(),
             lastDepositAt: 0,
-            status: VaultStatus.Active
+            shares: 0,
+            targetAmount: targetAmount.toUint128(),
+            depositedAmount: 0
         });
 
         _userVaultIds[msg.sender].push(vaultId);
@@ -164,11 +181,25 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
 
         if (amount == 0) revert InvalidTarget();
 
+        if (totalShares == 0 && amount < MINIMUM_LIQUIDITY) {
+            revert FirstDepositTooSmall();
+        }
+
         uint256 assetsBefore = totalAssets();
 
         uint256 shares = _convertToShares(amount, assetsBefore);
 
         if (shares == 0) revert InvalidShares();
+
+        // Effects before interactions: update all accounting first, then
+        // move tokens, so a reentrant call would see fully-consistent state
+        // even if the ReentrancyGuard were ever removed from this function.
+        vault.depositedAmount += amount.toUint128();
+        vault.shares += shares.toUint128();
+        vault.depositCount += 1;
+        vault.lastDepositAt = block.timestamp.toUint40();
+
+        totalShares += shares;
 
         usdt.safeTransferFrom(msg.sender, address(this), amount);
 
@@ -179,13 +210,6 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
 
             require(deposited == amount, "Strategy deposit mismatch");
         }
-
-        vault.depositedAmount += amount;
-        vault.shares += shares;
-        vault.depositCount += 1;
-        vault.lastDepositAt = block.timestamp;
-
-        totalShares += shares;
 
         emit DepositMade(vaultId, msg.sender, amount, shares, block.timestamp);
     }
@@ -313,9 +337,14 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
         uint256 assets,
         uint256 assetsBefore
     ) internal view returns (uint256) {
-        if (totalShares == 0) {
-            // burn MINIMUM_LIQUIDITY once at the very first deposit
-            return assets - MINIMUM_LIQUIDITY; // minted separately to address(0)
+        // First-ever deposit (or a total wipeout where totalAssets() has
+        // fallen back to zero while shares are still outstanding) mints
+        // shares 1:1 with assets. `deposit()` enforces a MINIMUM_LIQUIDITY
+        // floor on the very first deposit so the pool can't be bootstrapped
+        // with a dust amount that would make the share price trivial to
+        // manipulate via a direct token donation to the vault.
+        if (totalShares == 0 || assetsBefore == 0) {
+            return assets;
         }
         return (assets * totalShares) / assetsBefore;
     }
@@ -385,10 +414,15 @@ contract StableSaveVault is Ownable, Pausable, ReentrancyGuard {
     }
 
     function exitStrategy() external onlyOwner {
+        if (address(strategy) == address(0)) revert InvalidStrategy();
+
         uint256 assets = strategy.totalAssets();
         if (assets > 0) strategy.withdraw(assets, address(this));
-        // keep strategy address so deposits flow through again, or set to zero:
+
+        address previous = address(strategy);
         strategy = IYieldStrategy(address(0));
+
+        emit StrategyUpdated(previous, address(0));
     }
 
     // ---------------------------------------------------------

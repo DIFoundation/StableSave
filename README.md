@@ -36,10 +36,12 @@ behavioral nudge that keeps people from raiding their own savings.
 ```
 contract/                Foundry project — the on-chain vault
   src/StableSaveVault.sol       Core vault contract
+  src/StableSaveTreasury.sol    Minimal treasury contract for penalty fees
   src/interfaces/IYieldStrategy.sol  Pluggable yield strategy interface
   src/mocks/                    MockUSDT + MockYieldStrategy for local testing
   script/Deploy.s.sol           Deployment script
   test/StableSaveVault.t.sol    Foundry test suite
+  test/StableSaveTreasury.t.sol Treasury contract test suite
 ```
 
 There is currently no frontend in this repo — the contract is the whole
@@ -68,6 +70,12 @@ forge script script/Deploy.s.sol:DeployScript \
 RPC endpoints for BOTChain testnet/mainnet are pre-configured in
 `contract/foundry.toml`.
 
+If `TREASURY_ADDRESS` is left blank in `.env`, the script deploys a fresh
+`StableSaveTreasury` (owned by the deployer) and wires it into the vault
+automatically. Set `TREASURY_ADDRESS` instead to point at an
+already-deployed treasury — e.g. a multisig, or a `StableSaveTreasury`
+from a previous run.
+
 ## Contract design notes
 
 - **Shares, not raw balances.** `Vault.shares` (per-vault) and `totalShares`
@@ -92,6 +100,13 @@ RPC endpoints for BOTChain testnet/mainnet are pre-configured in
   redemptions can be at most a few wei short of the theoretical value —
   negligible at USDT's 6 decimals, but worth knowing if you're writing tests
   or off-chain accounting against exact amounts.
+- **Treasury is mutable, USDT is not.** `usdt` is set once at deployment
+  and can never change — swapping the underlying asset would break every
+  vault's accounting. `treasury` can be updated via `setTreasury()`
+  (owner-only) since a fixed EOA with no recovery path is a real risk,
+  not a convenience worth losing. Point it at `StableSaveTreasury` (a
+  minimal, owner-controlled contract that just holds and forwards
+  penalty fees) or a multisig — never a personal wallet.
 
 ## Testing
 
@@ -104,4 +119,5 @@ forge test -vv
 single/multiple vaults, maturity gating, early-withdrawal penalties, yield
 distribution (including simultaneous depositors and late joiners not
 capturing past yield), strategy loss propagation, pausing, and the
-first-deposit/strategy-exit edge cases described above.
+first-deposit/strategy-exit edge cases described above. A further 8 tests
+cover `StableSaveTreasury` directly.
